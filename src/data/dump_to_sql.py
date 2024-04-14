@@ -1,9 +1,10 @@
-import gc
-import os
 import sys
+import gc
+import io
 
 import pandas as pd
 from sqlalchemy import create_engine
+from minio import Minio
 
 
 def write_data_postgres(dataframe: pd.DataFrame) -> bool:
@@ -35,12 +36,12 @@ def write_data_postgres(dataframe: pd.DataFrame) -> bool:
         engine = create_engine(db_config["database_url"])
         with engine.connect():
             success: bool = True
-            print("Connection successful! Processing parquet file")
+            print("Connection successful! Writing Parquet file to database")
             dataframe.to_sql(db_config["dbms_table"], engine, index=False, if_exists='append')
 
     except Exception as e:
         success: bool = False
-        print(f"Error connection to the database: {e}")
+        print(f"Error connecting to the database: {e}")
         return success
 
     return success
@@ -48,7 +49,8 @@ def write_data_postgres(dataframe: pd.DataFrame) -> bool:
 
 def clean_column_name(dataframe: pd.DataFrame) -> pd.DataFrame:
     """
-    Take a Dataframe and rewrite it columns into a lowercase format.
+    Take a Dataframe and rewrite its columns into a lowercase format.
+
     Parameters:
         - dataframe (pd.DataFrame) : The dataframe columns to change
 
@@ -60,19 +62,43 @@ def clean_column_name(dataframe: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
-    # folder_path: str = r'..\..\data\raw'
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Construct the relative path to the folder
-    folder_path = os.path.join(script_dir, '..', '..', 'data', 'raw')
+    # Configuration Minio
+    minio_endpoint = 'localhost:9000'
+    minio_access_key = 'minio'
+    minio_secret_key = 'minio123'
+    minio_bucket_name = 'buckettaxi'
+    minio_file_prefix = 'yellow_tripdata_2023-'  # Préfixe des noms de fichiers Parquet dans Minio
 
-    parquet_files = [f for f in os.listdir(folder_path) if
-                     f.lower().endswith('.parquet') and os.path.isfile(os.path.join(folder_path, f))]
+    # Initialiser le client Minio
+    minio_client = Minio(minio_endpoint,
+                         access_key=minio_access_key,
+                         secret_key=minio_secret_key,
+                         secure=False)
+
+    print(f"connection minio ok")
+    # Récupérer la liste des objets (fichiers) dans le bucket Minio
+    parquet_files = [obj.object_name for obj in minio_client.list_objects(minio_bucket_name)
+                     if obj.object_name.startswith(minio_file_prefix)]
+    print(f"liste d'objet récupéré")
 
     for parquet_file in parquet_files:
-        parquet_df: pd.DataFrame = pd.read_parquet(os.path.join(folder_path, parquet_file), engine='pyarrow')
+        # Télécharger le fichier Parquet depuis Minio et le lire dans un DataFrame
+        parquet_object = minio_client.get_object(minio_bucket_name, parquet_file)
+        
+        # Read Parquet file content into BytesIO object
+        parquet_content = parquet_object.read()
 
+        # Use BytesIO object to read Parquet file using pd.read_parquet
+        parquet_df = pd.read_parquet(io.BytesIO(parquet_content), engine="pyarrow")
+
+        print(f"Nettoyage des colonnes")
+        # Nettoyer les noms de colonnes du DataFrame
         clean_column_name(parquet_df)
+        print(f"Colonne nettoyé")
+
+        # Écrire les données dans PostgreSQL
         if not write_data_postgres(parquet_df):
+            print(f"Écrire les données dans PostgreSQL")
             del parquet_df
             gc.collect()
             return
